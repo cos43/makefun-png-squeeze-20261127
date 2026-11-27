@@ -271,9 +271,27 @@ function filterRowInto(
   return sum;
 }
 
+/** Distinct adjacent byte pairs in a row: few pairs means long repeats, which the deflater's matches love. */
+const PAIR_SEEN = new Uint32Array(65536);
+let pairStamp = 0;
+function pairsCount(row: Uint8Array): number {
+  pairStamp++;
+  const stamp = pairStamp;
+  let count = 0;
+  for (let i = 0; i < row.length - 1; i++) {
+    const p = (row[i] << 8) | row[i + 1];
+    if (PAIR_SEEN[p] !== stamp) {
+      PAIR_SEEN[p] = stamp;
+      count++;
+    }
+  }
+  return count;
+}
+
 function filterWithMode(samples: Uint8Array, width: number, height: number, bpp: number, mode: number): Uint8Array {
   // mode 0-4: one fixed filter for every row; mode 5: each row its own
-  // minimum-absolute-residual filter.
+  // minimum-absolute-residual filter; mode 6: each row the filter with the
+  // fewest distinct adjacent byte pairs.
   const stride = width * bpp;
   const raw = new Uint8Array(height * (stride + 1));
   const trials = [new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride)];
@@ -281,12 +299,14 @@ function filterWithMode(samples: Uint8Array, width: number, height: number, bpp:
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
     let type = mode;
-    if (mode === 5) {
-      let bestSum = Infinity;
+    if (mode === 5 || mode === 6) {
+      let bestScore = Infinity;
       for (let t = 0; t < 5; t++) {
-        const s = filterRowInto(t, cur, prev, bpp, trials[t]);
-        if (s < bestSum) {
-          bestSum = s;
+        const s = mode === 5
+          ? filterRowInto(t, cur, prev, bpp, trials[t])
+          : (filterRowInto(t, cur, prev, bpp, trials[t]), pairsCount(trials[t]));
+        if (s < bestScore) {
+          bestScore = s;
           type = t;
         }
       }
@@ -294,9 +314,9 @@ function filterWithMode(samples: Uint8Array, width: number, height: number, bpp:
       raw[at] = type;
       raw.set(trials[type], at + 1);
     } else {
-      filterRowInto(type, cur, prev, bpp, trials[0]);
+      filterRowInto(mode, cur, prev, bpp, trials[0]);
       const at = y * (stride + 1);
-      raw[at] = type;
+      raw[at] = mode;
       raw.set(trials[0], at + 1);
     }
   }
@@ -415,7 +435,7 @@ function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
   return [{ colourType: 6, bpp: 4, samples: rgba }];
 }
 
-const SCREEN_MODES = [0, 2, 4, 5]; // None, Up, Paeth, per-row minimum-residual
+const SCREEN_MODES = [0, 1, 2, 3, 4, 5, 6]; // fixed filters, per-row min-residual, per-row fewest-pairs
 
 function encode(rgba: Uint8Array, width: number, height: number): Uint8Array {
   const forms = formsOf(rgba, width, height);
