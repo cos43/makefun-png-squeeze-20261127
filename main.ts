@@ -334,6 +334,7 @@ function filterWithMode(samples: Uint8Array, width: number, height: number, bpp:
 function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
   const n = width * height;
   const seen = new Map<number, number>();
+  const counts = new Map<number, number>();
   let allGrey = true;
   let allOpaque = true;
   for (let i = 0, d = 0; i < n; i++, d += 4) {
@@ -346,15 +347,21 @@ function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
     if (seen.size <= 256) {
       const key = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
       if (!seen.has(key)) seen.set(key, seen.size);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
     }
   }
-  const paletteForm = (): Reduced | null => {
+  const paletteForm = (order: 'luminance' | 'count'): Reduced | null => {
     if (seen.size > 256) return null;
     const keys = [...seen.keys()].sort((a, b) => {
       const ta = (a & 0xff) === 255 ? 1 : 0;
       const tb = (b & 0xff) === 255 ? 1 : 0;
       if (ta !== tb) return ta - tb;
       if (ta === 0 && (a & 0xff) !== (b & 0xff)) return (a & 0xff) - (b & 0xff);
+      if (order === 'count') {
+        const ca = counts.get(a) as number;
+        const cb = counts.get(b) as number;
+        return cb - ca || (a < b ? -1 : a > b ? 1 : 0);
+      }
       const la = 299 * ((a >>> 24) & 0xff) + 587 * ((a >>> 16) & 0xff) + 114 * ((a >>> 8) & 0xff);
       const lb = 299 * ((b >>> 24) & 0xff) + 587 * ((b >>> 16) & 0xff) + 114 * ((b >>> 8) & 0xff);
       return la - lb || (a < b ? -1 : a > b ? 1 : 0);
@@ -399,14 +406,18 @@ function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
     for (let i = 0, d = 0; i < n; i++, d += 4) grey[i] = rgba[d];
     if (allOpaque) {
       const forms: Reduced[] = [{ colourType: 0, bpp: 1, samples: grey }];
-      const pal = paletteForm();
-      if (pal !== null) forms.push(pal);
+      for (const order of ['luminance', 'count'] as const) {
+        const pal = paletteForm(order);
+        if (pal !== null) forms.push(pal);
+      }
       return forms;
     }
     if (key !== null && 'grey' in key) {
       const forms: Reduced[] = [{ colourType: 0, bpp: 1, samples: grey, keyTrns: Uint8Array.of(0, key.grey) }];
-      const pal = paletteForm();
-      if (pal !== null) forms.push(pal);
+      for (const order of ['luminance', 'count'] as const) {
+        const pal = paletteForm(order);
+        if (pal !== null) forms.push(pal);
+      }
       return forms;
     }
     const samples = new Uint8Array(n * 2);
@@ -415,12 +426,14 @@ function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
       samples[s + 1] = rgba[d + 3];
     }
     const forms: Reduced[] = [{ colourType: 4, bpp: 2, samples }];
-    const pal = paletteForm();
-    if (pal !== null) forms.push(pal);
+    for (const order of ['luminance', 'count'] as const) {
+      const pal = paletteForm(order);
+      if (pal !== null) forms.push(pal);
+    }
     return forms;
   }
-  const pal = paletteForm();
-  if (pal !== null) return [pal];
+  const pals = ['luminance', 'count'].map((o) => paletteForm(o as 'luminance' | 'count')).filter((p): p is Reduced => p !== null);
+  if (pals.length > 0) return pals;
   const key = transparentKey(rgba, width, height);
   if (key !== null) {
     const t = 'grey' in key
