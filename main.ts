@@ -5,10 +5,13 @@
 //      become a palette image (colour type 3 + tRNS when any alpha < 255);
 //      an all-grey image becomes grey (type 0) or grey+alpha (type 4);
 //      an opaque colour image becomes RGB (type 2); the rest stays RGBA;
-//   3. pick each row's filter (None/Sub/Up/Average/Paeth) by the smallest sum
-//      of absolute signed residual bytes — the filter that leaves the least
-//      entropy for the deflater;
-//   4. one zlib level-9 stream, one IDAT, no ancillary chunks.
+//   3. screen every faithful form (palette / grey / RGB / RGBA, with tRNS
+//      keys where they apply) under several filter modes (None, Up, Paeth,
+//      per-row minimum-residual), weighing each by a real level-6 deflate:
+//      the best filter varies per image and residual size does not predict
+//      compressed size — flat shots like unfiltered rows, photo-like ones
+//      like Paeth;
+//   4. re-deflate the winner at level 9, one IDAT, no ancillary chunks.
 // Everything is deterministic: no clock, no randomness, no environment reads
 // beyond the input/output directories the contest mounts.
 import { inflateSync, deflateSync } from 'node:zlib';
@@ -182,82 +185,39 @@ interface Reduced {
   samples: Uint8Array;
   palette?: Uint8Array; // RGB triples, colour type 3
   trns?: Uint8Array; // alpha per palette entry, colour type 3
+  keyTrns?: Uint8Array; // tRNS key bytes, colour types 0 and 2
 }
 
-function reduce(rgba: Uint8Array, width: number, height: number): Reduced {
+/**
+ * The one fully transparent value the image may key by tRNS instead of an
+ * alpha channel: every pixel is opaque or that exact value at alpha 0, and
+ * no opaque pixel uses the value. Returns {grey} or {r,g,b}, else null.
+ */
+function transparentKey(rgba: Uint8Array, width: number, height: number): { grey: number } | { r: number; g: number; b: number } | null {
   const n = width * height;
-  // Pass 1: distinct colours (cap the count at 257), grey-ness, opacity.
-  const seen = new Map<number, number>();
-  let allGrey = true;
-  let allOpaque = true;
-  for (let i = 0, d = 0; i < n; i++, d += 4) {
-    const r = rgba[d];
-    const g = rgba[d + 1];
-    const b = rgba[d + 2];
+  let keyR = -1;
+  let keyG = -1;
+  let keyB = -1;
+  for (let d = 0; d < rgba.length; d += 4) {
     const a = rgba[d + 3];
-    if (r !== g || g !== b) allGrey = false;
-    if (a !== 255) allOpaque = false;
-    if (seen.size <= 256) {
-      const key = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
-      if (!seen.has(key)) seen.set(key, seen.size);
+    if (a === 255) continue;
+    if (a !== 0) return null;
+    if (keyR === -1) {
+      keyR = rgba[d];
+      keyG = rgba[d + 1];
+      keyB = rgba[d + 2];
+    } else if (rgba[d] !== keyR || rgba[d + 1] !== keyG || rgba[d + 2] !== keyB) {
+      return null;
     }
   }
-  if (allGrey) {
-    // Grey first: the sample IS the grey value, so the row filters predict
-    // on real brightness instead of on arbitrary palette indices.
-    if (allOpaque) {
-      const samples = new Uint8Array(n);
-      for (let i = 0, d = 0; i < n; i++, d += 4) samples[i] = rgba[d];
-      return { colourType: 0, bpp: 1, samples };
-    }
-    const samples = new Uint8Array(n * 2);
-    for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += 2) {
-      samples[s] = rgba[d];
-      samples[s + 1] = rgba[d + 3];
-    }
-    return { colourType: 4, bpp: 2, samples };
+  if (keyR === -1) return null;
+  for (let d = 0; d < rgba.length; d += 4) {
+    if (rgba[d + 3] !== 255) continue;
+    if (rgba[d] === keyR && rgba[d + 1] === keyG && rgba[d + 2] === keyB) return null;
   }
-  if (seen.size <= 256) {
-    // Palette image: 1 byte per pixel, exact RGBA via PLTE + tRNS.
-    // Sort the palette by colour so neighbouring similar colours get close
-    // indices — the row filters then leave small residuals.
-    const keys = [...seen.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    const remap = new Map<number, number>();
-    const palette = new Uint8Array(keys.length * 3);
-    const alphas = new Uint8Array(keys.length);
-    let anyAlpha = false;
-    keys.forEach((key, idx) => {
-      remap.set(key, idx);
-      palette[idx * 3] = (key >>> 24) & 0xff;
-      palette[idx * 3 + 1] = (key >>> 16) & 0xff;
-      palette[idx * 3 + 2] = (key >>> 8) & 0xff;
-      alphas[idx] = key & 0xff;
-      if ((key & 0xff) !== 255) anyAlpha = true;
-    });
-    const samples = new Uint8Array(n);
-    for (let i = 0, d = 0; i < n; i++, d += 4) {
-      const key = ((rgba[d] << 24) | (rgba[d + 1] << 16) | (rgba[d + 2] << 8) | rgba[d + 3]) >>> 0;
-      samples[i] = remap.get(key) as number;
-    }
-    // tRNS may stop at the last non-opaque entry.
-    let trns: Uint8Array | undefined;
-    if (anyAlpha) {
-      let last = keys.length - 1;
-      while (last > 0 && alphas[last] === 255) last--;
-      trns = alphas.subarray(0, last + 1);
-    }
-    return { colourType: 3, bpp: 1, samples, palette, trns };
-  }
-  if (allOpaque) {
-    const samples = new Uint8Array(n * 3);
-    for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += 3) {
-      samples[s] = rgba[d];
-      samples[s + 1] = rgba[d + 1];
-      samples[s + 2] = rgba[d + 2];
-    }
-    return { colourType: 2, bpp: 3, samples };
-  }
-  return { colourType: 6, bpp: 4, samples: rgba };
+  void n;
+  if (keyR === keyG && keyG === keyB) return { grey: keyR };
+  return { r: keyR, g: keyG, b: keyB };
 }
 
 // ---- Filtering: per-row minimum-absolute-residual choice -------------------
@@ -311,38 +271,175 @@ function filterRowInto(
   return sum;
 }
 
-function filterBest(samples: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
+function filterWithMode(samples: Uint8Array, width: number, height: number, bpp: number, mode: number): Uint8Array {
+  // mode 0-4: one fixed filter for every row; mode 5: each row its own
+  // minimum-absolute-residual filter.
   const stride = width * bpp;
   const raw = new Uint8Array(height * (stride + 1));
   const trials = [new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride), new Uint8Array(stride)];
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
-    let bestType = 0;
-    let bestSum = Infinity;
-    for (let t = 0; t < 5; t++) {
-      const s = filterRowInto(t, cur, prev, bpp, trials[t]);
-      if (s < bestSum) {
-        bestSum = s;
-        bestType = t;
+    let type = mode;
+    if (mode === 5) {
+      let bestSum = Infinity;
+      for (let t = 0; t < 5; t++) {
+        const s = filterRowInto(t, cur, prev, bpp, trials[t]);
+        if (s < bestSum) {
+          bestSum = s;
+          type = t;
+        }
       }
+      const at = y * (stride + 1);
+      raw[at] = type;
+      raw.set(trials[type], at + 1);
+    } else {
+      filterRowInto(type, cur, prev, bpp, trials[0]);
+      const at = y * (stride + 1);
+      raw[at] = type;
+      raw.set(trials[0], at + 1);
     }
-    const at = y * (stride + 1);
-    raw[at] = bestType;
-    raw.set(trials[bestType], at + 1);
   }
   return raw;
 }
 
 // ---- Encoding ----------------------------------------------------------------
 
+/**
+ * The forms an image can be written in, smallest raw first. A form is one
+ * colour type with its samples; the screen weighs each by real compressed
+ * size, since the best filter varies per image (flat shots like unfiltered
+ * rows, photo-like ones like Paeth) and residual size does not predict it.
+ */
+function formsOf(rgba: Uint8Array, width: number, height: number): Reduced[] {
+  const n = width * height;
+  const seen = new Map<number, number>();
+  let allGrey = true;
+  let allOpaque = true;
+  for (let i = 0, d = 0; i < n; i++, d += 4) {
+    const r = rgba[d];
+    const g = rgba[d + 1];
+    const b = rgba[d + 2];
+    const a = rgba[d + 3];
+    if (r !== g || g !== b) allGrey = false;
+    if (a !== 255) allOpaque = false;
+    if (seen.size <= 256) {
+      const key = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
+      if (!seen.has(key)) seen.set(key, seen.size);
+    }
+  }
+  const paletteForm = (): Reduced | null => {
+    if (seen.size > 256) return null;
+    const keys = [...seen.keys()].sort((a, b) => {
+      const ta = (a & 0xff) === 255 ? 1 : 0;
+      const tb = (b & 0xff) === 255 ? 1 : 0;
+      if (ta !== tb) return ta - tb;
+      if (ta === 0 && (a & 0xff) !== (b & 0xff)) return (a & 0xff) - (b & 0xff);
+      const la = 299 * ((a >>> 24) & 0xff) + 587 * ((a >>> 16) & 0xff) + 114 * ((a >>> 8) & 0xff);
+      const lb = 299 * ((b >>> 24) & 0xff) + 587 * ((b >>> 16) & 0xff) + 114 * ((b >>> 8) & 0xff);
+      return la - lb || (a < b ? -1 : a > b ? 1 : 0);
+    });
+    const remap = new Map<number, number>();
+    const palette = new Uint8Array(keys.length * 3);
+    const alphas = new Uint8Array(keys.length);
+    let anyAlpha = false;
+    keys.forEach((key, idx) => {
+      remap.set(key, idx);
+      palette[idx * 3] = (key >>> 24) & 0xff;
+      palette[idx * 3 + 1] = (key >>> 16) & 0xff;
+      palette[idx * 3 + 2] = (key >>> 8) & 0xff;
+      alphas[idx] = key & 0xff;
+      if ((key & 0xff) !== 255) anyAlpha = true;
+    });
+    const samples = new Uint8Array(n);
+    for (let i = 0, d = 0; i < n; i++, d += 4) {
+      const key = ((rgba[d] << 24) | (rgba[d + 1] << 16) | (rgba[d + 2] << 8) | rgba[d + 3]) >>> 0;
+      samples[i] = remap.get(key) as number;
+    }
+    let trns: Uint8Array | undefined;
+    if (anyAlpha) {
+      let last = keys.length - 1;
+      while (last > 0 && alphas[last] === 255) last--;
+      trns = alphas.subarray(0, last + 1);
+    }
+    return { colourType: 3, bpp: 1, samples, palette, trns };
+  };
+  const rgbSamples = (): Uint8Array => {
+    const samples = new Uint8Array(n * 3);
+    for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += 3) {
+      samples[s] = rgba[d];
+      samples[s + 1] = rgba[d + 1];
+      samples[s + 2] = rgba[d + 2];
+    }
+    return samples;
+  };
+  if (allGrey) {
+    const key = transparentKey(rgba, width, height);
+    const grey = new Uint8Array(n);
+    for (let i = 0, d = 0; i < n; i++, d += 4) grey[i] = rgba[d];
+    if (allOpaque) {
+      const forms: Reduced[] = [{ colourType: 0, bpp: 1, samples: grey }];
+      const pal = paletteForm();
+      if (pal !== null) forms.push(pal);
+      return forms;
+    }
+    if (key !== null && 'grey' in key) {
+      const forms: Reduced[] = [{ colourType: 0, bpp: 1, samples: grey, keyTrns: Uint8Array.of(0, key.grey) }];
+      const pal = paletteForm();
+      if (pal !== null) forms.push(pal);
+      return forms;
+    }
+    const samples = new Uint8Array(n * 2);
+    for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += 2) {
+      samples[s] = rgba[d];
+      samples[s + 1] = rgba[d + 3];
+    }
+    const forms: Reduced[] = [{ colourType: 4, bpp: 2, samples }];
+    const pal = paletteForm();
+    if (pal !== null) forms.push(pal);
+    return forms;
+  }
+  const pal = paletteForm();
+  if (pal !== null) return [pal];
+  const key = transparentKey(rgba, width, height);
+  if (key !== null) {
+    const t = 'grey' in key
+      ? Uint8Array.of(0, key.grey, 0, key.grey, 0, key.grey)
+      : Uint8Array.of(0, key.r, 0, key.g, 0, key.b);
+    return [
+      { colourType: 2, bpp: 3, samples: rgbSamples(), keyTrns: t },
+      { colourType: 6, bpp: 4, samples: rgba },
+    ];
+  }
+  if (allOpaque) return [{ colourType: 2, bpp: 3, samples: rgbSamples() }];
+  return [{ colourType: 6, bpp: 4, samples: rgba }];
+}
+
+const SCREEN_MODES = [0, 2, 4, 5]; // None, Up, Paeth, per-row minimum-residual
+
 function encode(rgba: Uint8Array, width: number, height: number): Uint8Array {
-  const r = reduce(rgba, width, height);
-  const raw = filterBest(r.samples, width, height, r.bpp);
-  const compressed = deflateSync(raw, { level: 9 });
-  const parts: Uint8Array[] = [chunk('IHDR', ihdr(width, height, r.colourType))];
-  if (r.palette) parts.push(chunk('PLTE', r.palette));
-  if (r.trns) parts.push(chunk('tRNS', r.trns));
+  const forms = formsOf(rgba, width, height);
+  // Screen: every form under every mode, weighed by a level-6 deflate, and
+  // keep the smallest. The winner is re-deflated at level 9.
+  let bestForm = forms[0];
+  let bestRaw: Uint8Array | null = null;
+  let bestSize = Infinity;
+  for (const form of forms) {
+    for (const mode of SCREEN_MODES) {
+      const raw = filterWithMode(form.samples, width, height, form.bpp, mode);
+      const size = deflateSync(raw, { level: 6 }).length;
+      if (size < bestSize) {
+        bestSize = size;
+        bestForm = form;
+        bestRaw = raw;
+      }
+    }
+  }
+  const compressed = deflateSync(bestRaw as Uint8Array, { level: 9 });
+  const parts: Uint8Array[] = [chunk('IHDR', ihdr(width, height, bestForm.colourType))];
+  if (bestForm.palette) parts.push(chunk('PLTE', bestForm.palette));
+  if (bestForm.trns) parts.push(chunk('tRNS', bestForm.trns));
+  if (bestForm.keyTrns) parts.push(chunk('tRNS', bestForm.keyTrns));
   parts.push(chunk('IDAT', new Uint8Array(compressed)));
   parts.push(chunk('IEND', new Uint8Array(0)));
   return assemble(parts);
